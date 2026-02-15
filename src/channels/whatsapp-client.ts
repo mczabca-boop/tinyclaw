@@ -172,13 +172,17 @@ function pairingMessage(code: string): string {
     ].join('\n');
 }
 
+// Default to non-headless mode for better WhatsApp Web compatibility.
+// Set WHATSAPP_HEADLESS=true to force headless mode.
+const whatsappHeadless = process.env.WHATSAPP_HEADLESS === 'true';
+
 // Initialize WhatsApp client
 const client = new Client({
     authStrategy: new LocalAuth({
         dataPath: SESSION_DIR
     }),
     puppeteer: {
-        headless: true,
+        headless: whatsappHeadless,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -524,4 +528,5 @@ process.on('SIGTERM', async () => {
 
 // Start client
 log('INFO', 'Starting WhatsApp client...');
+log('INFO', `Puppeteer headless mode: ${whatsappHeadless ? 'enabled' : 'disabled'}`);
 client.initialize();
