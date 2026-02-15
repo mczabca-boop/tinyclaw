@@ -13,9 +13,10 @@ import { ensureSenderPaired } from '../lib/pairing';
 
 const SCRIPT_DIR = path.resolve(__dirname, '..', '..');
 const _localTinyclaw = path.join(SCRIPT_DIR, '.tinyclaw');
-const TINYCLAW_HOME = fs.existsSync(path.join(_localTinyclaw, 'settings.json'))
-    ? _localTinyclaw
-    : path.join(require('os').homedir(), '.tinyclaw');
+const TINYCLAW_HOME = process.env.TINYCLAW_HOME
+    || (fs.existsSync(path.join(_localTinyclaw, 'settings.json'))
+        ? _localTinyclaw
+        : path.join(require('os').homedir(), '.tinyclaw'));
 const QUEUE_INCOMING = path.join(TINYCLAW_HOME, 'queue/incoming');
 const QUEUE_OUTGOING = path.join(TINYCLAW_HOME, 'queue/outgoing');
 const LOG_FILE = path.join(TINYCLAW_HOME, 'logs/whatsapp.log');
@@ -406,18 +407,29 @@ async function checkOutgoingQueue(): Promise<void> {
 
             try {
                 const responseData: ResponseData = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-                const { messageId, message: responseText, sender } = responseData;
+                const { messageId, message: responseText, sender, senderId } = responseData;
 
-                // Find pending message
+                // Find pending message, or fall back to senderId for proactive messages
                 const pending = pendingMessages.get(messageId);
-                if (pending) {
+                let targetChat: Chat | null = pending?.chat ?? null;
+
+                if (!targetChat && senderId) {
+                    try {
+                        const chatId = senderId.includes('@') ? senderId : `${senderId}@c.us`;
+                        targetChat = await client.getChatById(chatId);
+                    } catch (err) {
+                        log('ERROR', `Could not get chat for senderId ${senderId}: ${(err as Error).message}`);
+                    }
+                }
+
+                if (targetChat) {
                     // Send any attached files first
                     if (responseData.files && responseData.files.length > 0) {
                         for (const file of responseData.files) {
                             try {
                                 if (!fs.existsSync(file)) continue;
                                 const media = MessageMedia.fromFilePath(file);
-                                await pending.chat.sendMessage(media);
+                                await targetChat.sendMessage(media);
                                 log('INFO', `Sent file to WhatsApp: ${path.basename(file)}`);
                             } catch (fileErr) {
                                 log('ERROR', `Failed to send file ${file}: ${(fileErr as Error).message}`);
@@ -427,42 +439,16 @@ async function checkOutgoingQueue(): Promise<void> {
 
                     // Send text response
                     if (responseText) {
-                        pending.message.reply(responseText);
-                    }
-                    log('INFO', `✓ Sent response to ${sender} (${responseText.length} chars${responseData.files ? `, ${responseData.files.length} file(s)` : ''})`);
-
-                    // Clean up
-                    pendingMessages.delete(messageId);
-                    fs.unlinkSync(filePath);
-                } else if (responseData.senderId) {
-                    // Proactive/agent-initiated message — send directly to user
-                    try {
-                        const chatId = responseData.senderId.includes('@') ? responseData.senderId : `${responseData.senderId}@c.us`;
-                        const chat = await client.getChatById(chatId);
-
-                        // Send any attached files first
-                        if (responseData.files && responseData.files.length > 0) {
-                            for (const file of responseData.files) {
-                                try {
-                                    if (!fs.existsSync(file)) continue;
-                                    const media = MessageMedia.fromFilePath(file);
-                                    await chat.sendMessage(media);
-                                    log('INFO', `Sent file to WhatsApp: ${path.basename(file)}`);
-                                } catch (fileErr) {
-                                    log('ERROR', `Failed to send file ${file}: ${(fileErr as Error).message}`);
-                                }
-                            }
+                        if (pending) {
+                            await pending.message.reply(responseText);
+                        } else {
+                            await targetChat.sendMessage(responseText);
                         }
-
-                        // Send text message
-                        if (responseText) {
-                            await chat.sendMessage(responseText);
-                        }
-
-                        log('INFO', `Sent proactive message to ${sender} (${responseText.length} chars${responseData.files ? `, ${responseData.files.length} file(s)` : ''})`);
-                    } catch (chatErr) {
-                        log('ERROR', `Failed to send proactive message to ${responseData.senderId}: ${(chatErr as Error).message}`);
                     }
+
+                    log('INFO', `Sent ${pending ? 'response' : 'proactive message'} to ${sender} (${responseText.length} chars${responseData.files ? `, ${responseData.files.length} file(s)` : ''})`);
+
+                    if (pending) pendingMessages.delete(messageId);
                     fs.unlinkSync(filePath);
                 } else {
                     log('WARN', `No pending message for ${messageId} and no senderId, cleaning up`);
