@@ -245,14 +245,19 @@ export function summarizeOpenVikingSearchHitDistribution(hits: OpenVikingSearchH
     return summary;
 }
 
-export function buildOpenVikingSearchPrefetchBlock(hits: OpenVikingSearchHit[], maxChars: number, maxHits: number): string {
-    if (!hits.length) return '';
+export function selectOpenVikingPrefetchHits(hits: OpenVikingSearchHit[], maxHits: number): OpenVikingSearchHit[] {
+    if (!hits.length) return [];
     const cap = Math.max(1, maxHits);
     const memoryHits = hits.filter((hit) => hit.type === 'memory');
     const resourceHits = hits.filter((hit) => hit.type === 'resource');
     const skillHits = hits.filter((hit) => hit.type === 'skill');
     // Memory-first composition keeps high-value long-term facts ahead of docs/skills.
-    const selected = [...memoryHits, ...resourceHits, ...skillHits].slice(0, cap);
+    return [...memoryHits, ...resourceHits, ...skillHits].slice(0, cap);
+}
+
+export function buildOpenVikingSearchPrefetchBlock(hits: OpenVikingSearchHit[], maxChars: number, maxHits: number): string {
+    if (!hits.length) return '';
+    const selected = selectOpenVikingPrefetchHits(hits, maxHits);
     const summary = summarizeOpenVikingSearchHitDistribution(selected);
     const lines: string[] = [];
     lines.push('[OpenViking Retrieved Context]');

@@ -12,6 +12,7 @@ type Command =
     | 'res-get'
     | 'res-put'
     | 'find-uris'
+    | 'grep'
     | 'search'
     | 'session-create'
     | 'session-message'
@@ -27,6 +28,7 @@ Usage:
   node openviking-tool.js res-get <uri> [--json]
   node openviking-tool.js res-put <uri> <content> [--mime <mime_type>] [--json]
   node openviking-tool.js find-uris <query> <target_path> [--limit <n>] [--score-threshold <n>] [--json]
+  node openviking-tool.js grep <pattern> [--uri <uri>] [--case-insensitive] [--json]
   node openviking-tool.js search <query> [--session-id <id>] [--limit <n>] [--score-threshold <n>] [--json]
   node openviking-tool.js session-create [--agent-id <id>] [--channel <name>] [--sender-id <id>] [--json]
   node openviking-tool.js session-message <session_id> <role> <content> [--json]
@@ -64,6 +66,7 @@ function positionalArguments(): string[] {
             arg === '--mime'
             || arg === '--limit'
             || arg === '--score-threshold'
+            || arg === '--uri'
             || arg === '--session-id'
             || arg === '--agent-id'
             || arg === '--channel'
@@ -72,6 +75,7 @@ function positionalArguments(): string[] {
             i += 1;
             continue;
         }
+        if (arg === '--case-insensitive') continue;
         output.push(arg);
     }
     return output;
@@ -284,6 +288,34 @@ function printFindUris(data: JsonValue): void {
     if (!matches.length) return;
     for (const m of matches) {
         console.log(`${m.score}\t${m.uri}`);
+    }
+}
+
+function extractGrepMatches(data: JsonValue): Array<{ uri: string; line: number; content: string }> {
+    const root = asObject(data);
+    const resultNode = asObject(root.result ?? root.data ?? root);
+    const matches = asArray(resultNode.matches);
+    const out: Array<{ uri: string; line: number; content: string }> = [];
+    for (const item of matches) {
+        const node = asObject(item);
+        const uri = String(node.uri ?? node.path ?? '').trim();
+        if (!uri) continue;
+        const line = Number(node.line ?? 0);
+        const content = String(node.content ?? node.text ?? '').trim();
+        out.push({
+            uri,
+            line: Number.isFinite(line) ? line : 0,
+            content,
+        });
+    }
+    return out;
+}
+
+function printGrepMatches(data: JsonValue): void {
+    const matches = extractGrepMatches(data);
+    if (!matches.length) return;
+    for (const m of matches) {
+        console.log(`${m.uri}\t${m.line}\t${m.content}`);
     }
 }
 
@@ -628,6 +660,24 @@ async function run(): Promise<void> {
             });
             if (jsonOutput) printJson(response);
             else printFindUris(response);
+            return;
+        }
+        case 'grep': {
+            if (!positional[1]) fail('Usage: grep <pattern> [--uri <uri>] [--case-insensitive]');
+            const pattern = positional[1];
+            const uriRaw = getFlagValue('--uri') || 'viking://user/memories';
+            const uri = toUri(uriRaw);
+            const caseInsensitive = args.includes('--case-insensitive');
+            response = await request('/api/v1/search/grep', {
+                method: 'POST',
+                body: JSON.stringify({
+                    uri,
+                    pattern,
+                    case_insensitive: caseInsensitive,
+                }),
+            });
+            if (jsonOutput) printJson(response);
+            else printGrepMatches(response);
             return;
         }
         case 'search': {

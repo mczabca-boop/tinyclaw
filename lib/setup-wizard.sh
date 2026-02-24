@@ -248,6 +248,7 @@ echo -e "${GREEN}  OpenViking Memory (Optional)${NC}"
 echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
 echo ""
 echo "Enable OpenViking native memory (Session + Search + Memory extraction)?"
+echo -e "${YELLOW}Current TinyClaw OpenViking integration supports OpenAI only (for VLM + embedding), and requires a valid OpenAI API key.${NC}"
 read -rp "Enable OpenViking? [y/N]: " ENABLE_OPENVIKING
 if [[ "$ENABLE_OPENVIKING" =~ ^[yY] ]]; then
     OPENVIKING_ENABLED=true
@@ -267,6 +268,7 @@ if [[ "$ENABLE_OPENVIKING" =~ ^[yY] ]]; then
     OV_LLM_API_BASE="https://api.openai.com/v1"
     OV_LLM_MODEL="gpt-4o-mini"
     OV_EMBED_MODEL="text-embedding-3-large"
+    OV_EMBED_DIMENSION=3072
 
     OPENVIKING_CONF_DIR="$(dirname "$OPENVIKING_CONFIG_PATH")"
     OPENVIKING_DATA_PATH="$HOME/.tinyclaw/openviking-data"
@@ -297,6 +299,7 @@ if [[ "$ENABLE_OPENVIKING" =~ ^[yY] ]]; then
       --arg api_base "$OV_LLM_API_BASE" \
       --arg vlm_model "$OV_LLM_MODEL" \
       --arg embed_model "$OV_EMBED_MODEL" \
+      --argjson embed_dimension "$OV_EMBED_DIMENSION" \
       '{
         storage: {
           agfs: {
@@ -312,6 +315,7 @@ if [[ "$ENABLE_OPENVIKING" =~ ^[yY] ]]; then
           dense: {
             provider: "openai",
             model: $embed_model,
+            dimension: $embed_dimension,
             api_key: $api_key,
             api_base: (if $api_base == "" then null else $api_base end)
           }

@@ -2,6 +2,75 @@
 # Daemon lifecycle management for TinyClaw
 # Handles starting, stopping, restarting, and status checking
 
+validate_openviking_embedding_dimension() {
+    local config_path="$1"
+
+    if ! command -v jq >/dev/null 2>&1; then
+        echo -e "${RED}jq is required for OpenViking config validation${NC}"
+        return 1
+    fi
+    if ! jq empty "$config_path" >/dev/null 2>&1; then
+        echo -e "${RED}OpenViking config is invalid JSON: $config_path${NC}"
+        return 1
+    fi
+
+    local embed_model
+    local expected_dim
+    local vectordb_path
+    embed_model=$(jq -r '.embedding.dense.model // empty' "$config_path" 2>/dev/null)
+    expected_dim=$(jq -r '.embedding.dense.dimension // empty' "$config_path" 2>/dev/null)
+    vectordb_path=$(jq -r '.storage.vectordb.path // empty' "$config_path" 2>/dev/null)
+
+    # For OpenAI text-embedding-3-large, explicit dimension avoids silent 2048 default mismatch.
+    if [ -z "$expected_dim" ] && [ "$embed_model" = "text-embedding-3-large" ]; then
+        echo -e "${RED}OpenViking config is missing embedding.dense.dimension for model ${embed_model}${NC}"
+        echo "Set embedding.dense.dimension to 3072 in $config_path and restart."
+        return 1
+    fi
+
+    if [ -z "$expected_dim" ]; then
+        return 0
+    fi
+
+    if ! [[ "$expected_dim" =~ ^[0-9]+$ ]]; then
+        echo -e "${RED}OpenViking embedding.dense.dimension must be a positive integer in $config_path${NC}"
+        return 1
+    fi
+
+    if [ -z "$vectordb_path" ] || [ ! -d "$vectordb_path/vectordb" ]; then
+        return 0
+    fi
+
+    local -a mismatches=()
+    while IFS= read -r meta_file; do
+        local actual_dim
+        local collection_name
+        actual_dim=$(jq -r '.Dimension // .FieldsDict.vector.Dim // ([.Fields[]? | select(.FieldName=="vector").Dim] | first) // empty' "$meta_file" 2>/dev/null)
+        if [ -z "$actual_dim" ] || ! [[ "$actual_dim" =~ ^[0-9]+$ ]]; then
+            continue
+        fi
+        if [ "$actual_dim" != "$expected_dim" ]; then
+            collection_name="$(basename "$(dirname "$meta_file")")"
+            mismatches+=("${collection_name}: expected=${expected_dim}, actual=${actual_dim}")
+        fi
+    done < <(find "$vectordb_path/vectordb" -type f -name 'collection_meta.json' 2>/dev/null)
+
+    if [ ${#mismatches[@]} -gt 0 ]; then
+        echo -e "${RED}OpenViking embedding dimension mismatch detected${NC}"
+        echo "Config: embedding.dense.dimension=${expected_dim} ($config_path)"
+        local item
+        for item in "${mismatches[@]}"; do
+            echo "VectorDB: $item"
+        done
+        echo "Fix either by:"
+        echo "  1) Updating ov.conf dimension to match existing VectorDB collection dimension"
+        echo "  2) Removing $vectordb_path and restarting to rebuild indexes with dimension ${expected_dim}"
+        return 1
+    fi
+
+    return 0
+}
+
 # Start daemon
 start_daemon() {
     if session_exists; then
@@ -110,6 +179,10 @@ start_daemon() {
         if [ ! -f "$OPENVIKING_CONFIG_PATH" ]; then
             echo -e "${RED}OpenViking is enabled but config file is missing: $OPENVIKING_CONFIG_PATH${NC}"
             echo "Run 'tinyclaw setup' again to regenerate OpenViking config."
+            return 1
+        fi
+        if ! validate_openviking_embedding_dimension "$OPENVIKING_CONFIG_PATH"; then
+            echo "Run 'tinyclaw setup' again or fix the OpenViking config/index paths before starting TinyClaw."
             return 1
         fi
         if curl -fsS --max-time 2 "$OPENVIKING_BASE_URL/health" >/dev/null 2>&1; then
