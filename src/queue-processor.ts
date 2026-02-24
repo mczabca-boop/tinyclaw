@@ -25,7 +25,7 @@ import {
 import { log, emitEvent } from './lib/logging';
 import { parseAgentRouting, findTeamForAgent, getAgentResetFlag, extractTeammateMentions } from './lib/routing';
 import { invokeAgent } from './lib/invoke';
-import { loadPlugins, runIncomingHooks, runOutgoingHooks, HookMetadata } from './lib/plugins';
+import { loadPlugins, runIncomingHooks, runOutgoingHooks } from './lib/plugins';
 import { jsonrepair } from 'jsonrepair';
 
 /** Parse JSON with automatic repair for malformed content (e.g. bad escapes). */
@@ -52,6 +52,15 @@ const queuedFiles = new Set<string>();
 const conversations = new Map<string, Conversation>();
 
 const MAX_CONVERSATION_MESSAGES = 50;
+
+function sanitizeResponseMetadata(metadata: Record<string, unknown>): Record<string, unknown> {
+    const allowed: Record<string, unknown> = {};
+    const parseMode = metadata.parseMode;
+    if (parseMode === 'MarkdownV2') {
+        allowed.parseMode = parseMode;
+    }
+    return allowed;
+}
 
 // Clean up orphaned files from processing/ on startup
 function recoverOrphanedFiles() {
@@ -181,6 +190,7 @@ async function completeConversation(conv: Conversation): Promise<void> {
 
     // Run outgoing hooks
     const { text: hookedResponse, metadata } = await runOutgoingHooks(finalResponse, { channel: conv.channel, sender: conv.sender, messageId: conv.messageId, originalMessage: conv.originalMessage });
+    const safeMetadata = sanitizeResponseMetadata(metadata);
 
     // Write to outgoing queue
     const responseData: ResponseData = {
@@ -191,7 +201,7 @@ async function completeConversation(conv: Conversation): Promise<void> {
         timestamp: Date.now(),
         messageId: conv.messageId,
         files: outboundFiles.length > 0 ? outboundFiles : undefined,
-        metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+        metadata: Object.keys(safeMetadata).length > 0 ? safeMetadata : undefined,
     };
 
     const responseFile = conv.channel === 'heartbeat'
@@ -359,6 +369,7 @@ async function processMessage(messageFile: string): Promise<void> {
 
             // Run outgoing hooks
             const { text: hookedResponse, metadata } = await runOutgoingHooks(finalResponse, { channel, sender, messageId, originalMessage: rawMessage });
+            const safeMetadata = sanitizeResponseMetadata(metadata);
 
             const responseData: ResponseData = {
                 channel,
@@ -369,7 +380,7 @@ async function processMessage(messageFile: string): Promise<void> {
                 messageId,
                 agent: agentId,
                 files: outboundFiles.length > 0 ? outboundFiles : undefined,
-                metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+                metadata: Object.keys(safeMetadata).length > 0 ? safeMetadata : undefined,
             };
 
             const responseFile = channel === 'heartbeat'
