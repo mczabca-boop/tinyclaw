@@ -16,7 +16,7 @@ import { log } from './logging';
 import type { AgentConfig, MessageData, Settings } from './types';
 
 const EXTERNAL_PLUGINS_ENABLED = process.env.TINYCLAW_PLUGINS_ENABLED === '1';
-const PLUGIN_HOOK_TIMEOUT_MS = Number(process.env.TINYCLAW_PLUGIN_HOOK_TIMEOUT_MS || 1500);
+const PLUGIN_HOOK_TIMEOUT_MS = Number(process.env.TINYCLAW_PLUGIN_HOOK_TIMEOUT_MS || 8000);
 const PLUGIN_ACTIVATE_TIMEOUT_MS = Number(process.env.TINYCLAW_PLUGIN_ACTIVATE_TIMEOUT_MS || 3000);
 
 // Types
