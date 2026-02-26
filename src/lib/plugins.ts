@@ -17,6 +17,9 @@ import type { AgentConfig, MessageData, Settings } from './types';
 
 const EXTERNAL_PLUGINS_ENABLED = process.env.TINYCLAW_PLUGINS_ENABLED === '1';
 const PLUGIN_HOOK_TIMEOUT_MS = Number(process.env.TINYCLAW_PLUGIN_HOOK_TIMEOUT_MS || 8000);
+const PLUGIN_SESSION_END_HOOK_TIMEOUT_MS = Number(
+    process.env.TINYCLAW_PLUGIN_SESSION_END_HOOK_TIMEOUT_MS || 30000
+);
 const PLUGIN_ACTIVATE_TIMEOUT_MS = Number(process.env.TINYCLAW_PLUGIN_ACTIVATE_TIMEOUT_MS || 3000);
 
 // Types
@@ -459,7 +462,7 @@ export async function runSessionEndHooks(ctx: SessionEndContext): Promise<void> 
             try {
                 await withTimeout(
                     Promise.resolve(plugin.hooks.onSessionEnd(ctx)),
-                    PLUGIN_HOOK_TIMEOUT_MS,
+                    PLUGIN_SESSION_END_HOOK_TIMEOUT_MS,
                     `plugin '${plugin.name}' onSessionEnd`
                 );
             } catch (error) {

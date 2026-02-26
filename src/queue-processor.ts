@@ -20,7 +20,7 @@ import { MessageData, ResponseData, QueueFile, ChainStep, Conversation, TeamConf
 import {
     QUEUE_INCOMING, QUEUE_OUTGOING, QUEUE_PROCESSING,
     LOG_FILE, EVENTS_DIR, CHATS_DIR, FILES_DIR,
-    getSettings, getAgents, getTeams
+    TINYCLAW_HOME, getSettings, getAgents, getTeams
 } from './lib/config';
 import { log, emitEvent } from './lib/logging';
 import { parseAgentRouting, findTeamForAgent, getAgentResetFlag, extractTeammateMentions } from './lib/routing';
@@ -55,6 +55,86 @@ function safeParseJSON<T = unknown>(raw: string, label?: string): T {
         fs.mkdirSync(dir, { recursive: true });
     }
 });
+
+const RUNTIME_DIR = path.join(TINYCLAW_HOME, 'runtime');
+const QUEUE_PROCESSOR_LOCK_FILE = path.join(RUNTIME_DIR, 'queue-processor.lock');
+let queueProcessorLockFd: number | null = null;
+
+function isPidRunning(pid: number): boolean {
+    if (!Number.isFinite(pid) || pid <= 0) return false;
+    try {
+        process.kill(pid, 0);
+        return true;
+    } catch (error) {
+        return (error as NodeJS.ErrnoException).code === 'EPERM';
+    }
+}
+
+function releaseQueueProcessorLock(): void {
+    if (queueProcessorLockFd !== null) {
+        try {
+            fs.closeSync(queueProcessorLockFd);
+        } catch {
+            // Ignore lock fd close errors during shutdown.
+        }
+        queueProcessorLockFd = null;
+    }
+    try {
+        if (fs.existsSync(QUEUE_PROCESSOR_LOCK_FILE)) {
+            fs.unlinkSync(QUEUE_PROCESSOR_LOCK_FILE);
+        }
+    } catch {
+        // Ignore lock file cleanup errors during shutdown.
+    }
+}
+
+function acquireQueueProcessorLock(): boolean {
+    if (!fs.existsSync(RUNTIME_DIR)) {
+        fs.mkdirSync(RUNTIME_DIR, { recursive: true });
+    }
+
+    for (let attempt = 0; attempt < 2; attempt++) {
+        try {
+            const fd = fs.openSync(QUEUE_PROCESSOR_LOCK_FILE, 'wx');
+            queueProcessorLockFd = fd;
+            const payload = {
+                pid: process.pid,
+                startedAt: new Date().toISOString(),
+            };
+            fs.writeFileSync(fd, JSON.stringify(payload, null, 2) + '\n', 'utf8');
+            return true;
+        } catch (error) {
+            const err = error as NodeJS.ErrnoException;
+            if (err.code !== 'EEXIST') {
+                log('ERROR', `Failed to acquire queue processor lock: ${err.message}`);
+                return false;
+            }
+
+            try {
+                const raw = fs.readFileSync(QUEUE_PROCESSOR_LOCK_FILE, 'utf8');
+                const lock = JSON.parse(raw) as { pid?: number };
+                const pid = Number(lock?.pid || 0);
+                if (isPidRunning(pid)) {
+                    log('WARN', `Queue processor already running (pid=${pid}), exiting duplicate instance`);
+                    return false;
+                }
+                fs.unlinkSync(QUEUE_PROCESSOR_LOCK_FILE);
+                log('WARN', `Removed stale queue processor lock (pid=${pid || 'unknown'})`);
+            } catch {
+                try {
+                    fs.unlinkSync(QUEUE_PROCESSOR_LOCK_FILE);
+                    log('WARN', 'Removed unreadable queue processor lock file');
+                } catch (unlinkError) {
+                    log('ERROR', `Failed to clear queue processor lock: ${(unlinkError as Error).message}`);
+                    return false;
+                }
+            }
+        }
+    }
+
+    log('ERROR', 'Failed to acquire queue processor lock after stale-lock recovery');
+    return false;
+}
 
 // Files currently queued in a promise chain — prevents duplicate processing across ticks
 const queuedFiles = new Set<string>();
@@ -620,6 +700,9 @@ if (!fs.existsSync(EVENTS_DIR)) {
 
 // Main loop
 (async () => {
+    if (!acquireQueueProcessorLock()) {
+        process.exit(0);
+    }
     log('INFO', 'Queue processor started');
     recoverOrphanedFiles();
     const startupSettings = getSettings();
@@ -651,8 +734,12 @@ async function gracefulShutdown(signal: string): Promise<void> {
         reason: 'shutdown',
         signal,
     });
+    releaseQueueProcessorLock();
     process.exit(0);
 }
 
 process.on('SIGINT', () => { void gracefulShutdown('SIGINT'); });
 process.on('SIGTERM', () => { void gracefulShutdown('SIGTERM'); });
+process.on('exit', () => {
+    releaseQueueProcessorLock();
+});
