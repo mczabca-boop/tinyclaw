@@ -16,9 +16,24 @@ import { log } from './logging';
 import type { AgentConfig, MessageData, Settings } from './types';
 
 const EXTERNAL_PLUGINS_ENABLED = process.env.TINYCLAW_PLUGINS_ENABLED === '1';
-const PLUGIN_HOOK_TIMEOUT_MS = Number(process.env.TINYCLAW_PLUGIN_HOOK_TIMEOUT_MS || 8000);
-const PLUGIN_SESSION_END_HOOK_TIMEOUT_MS = Number(
-    process.env.TINYCLAW_PLUGIN_SESSION_END_HOOK_TIMEOUT_MS || 30000
+function resolveTimeoutFromEnv(envName: string, fallback: number, min: number): number {
+    const raw = process.env[envName];
+    const value = Number(raw ?? fallback);
+    if (Number.isFinite(value) && value >= min) {
+        return Math.floor(value);
+    }
+    return fallback;
+}
+
+export const PLUGIN_HOOK_TIMEOUT_MS = resolveTimeoutFromEnv(
+    'TINYCLAW_PLUGIN_HOOK_TIMEOUT_MS',
+    8000,
+    1000
+);
+const PLUGIN_SESSION_END_HOOK_TIMEOUT_MS = resolveTimeoutFromEnv(
+    'TINYCLAW_PLUGIN_SESSION_END_HOOK_TIMEOUT_MS',
+    30000,
+    1000
 );
 const PLUGIN_ACTIVATE_TIMEOUT_MS = Number(process.env.TINYCLAW_PLUGIN_ACTIVATE_TIMEOUT_MS || 3000);
 
