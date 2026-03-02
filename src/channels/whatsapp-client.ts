@@ -11,13 +11,15 @@ import fs from 'fs';
 import path from 'path';
 import { ensureSenderPaired } from '../lib/pairing';
 
+const API_PORT = parseInt(process.env.TINYCLAW_API_PORT || '3777', 10);
+const API_BASE = `http://localhost:${API_PORT}`;
+
 const SCRIPT_DIR = path.resolve(__dirname, '..', '..');
 const _localTinyclaw = path.join(SCRIPT_DIR, '.tinyclaw');
-const TINYCLAW_HOME = fs.existsSync(path.join(_localTinyclaw, 'settings.json'))
-    ? _localTinyclaw
-    : path.join(require('os').homedir(), '.tinyclaw');
-const QUEUE_INCOMING = path.join(TINYCLAW_HOME, 'queue/incoming');
-const QUEUE_OUTGOING = path.join(TINYCLAW_HOME, 'queue/outgoing');
+const TINYCLAW_HOME = process.env.TINYCLAW_HOME
+    || (fs.existsSync(path.join(_localTinyclaw, 'settings.json'))
+        ? _localTinyclaw
+        : path.join(require('os').homedir(), '.tinyclaw'));
 const LOG_FILE = path.join(TINYCLAW_HOME, 'logs/whatsapp.log');
 const SESSION_DIR = path.join(SCRIPT_DIR, '.tinyclaw/whatsapp-session');
 const SETTINGS_FILE = path.join(TINYCLAW_HOME, 'settings.json');
@@ -25,7 +27,7 @@ const FILES_DIR = path.join(TINYCLAW_HOME, 'files');
 const PAIRING_FILE = path.join(TINYCLAW_HOME, 'pairing.json');
 
 // Ensure directories exist
-[QUEUE_INCOMING, QUEUE_OUTGOING, path.dirname(LOG_FILE), SESSION_DIR, FILES_DIR].forEach(dir => {
+[path.dirname(LOG_FILE), SESSION_DIR, FILES_DIR].forEach(dir => {
     if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true });
     }
@@ -35,27 +37,6 @@ interface PendingMessage {
     message: Message;
     chat: Chat;
     timestamp: number;
-}
-
-interface QueueData {
-    channel: string;
-    sender: string;
-    senderId: string;
-    message: string;
-    timestamp: number;
-    messageId: string;
-    files?: string[];
-}
-
-interface ResponseData {
-    channel: string;
-    sender: string;
-    senderId?: string;
-    message: string;
-    originalMessage: string;
-    timestamp: number;
-    messageId: string;
-    files?: string[];
 }
 
 // Media message types that we can download
@@ -178,7 +159,7 @@ const client = new Client({
         dataPath: SESSION_DIR
     }),
     puppeteer: {
-        headless: true,
+        headless: 'new' as any,
         args: [
             '--no-sandbox',
             '--disable-setuid-sandbox',
@@ -200,7 +181,7 @@ client.on('qr', (qr: string) => {
     qrcode.generate(qr, { small: true });
 
     // Save to file for tinyclaw.sh to display (avoids tmux capture distortion)
-    const channelsDir = path.join(SCRIPT_DIR, '.tinyclaw/channels');
+    const channelsDir = path.join(TINYCLAW_HOME, 'channels');
     if (!fs.existsSync(channelsDir)) {
         fs.mkdirSync(channelsDir, { recursive: true });
     }
@@ -225,7 +206,7 @@ client.on('ready', () => {
     log('INFO', 'Listening for messages...');
 
     // Create ready flag for tinyclaw.sh
-    const readyFile = path.join(SCRIPT_DIR, '.tinyclaw/channels/whatsapp_ready');
+    const readyFile = path.join(TINYCLAW_HOME, 'channels/whatsapp_ready');
     fs.writeFileSync(readyFile, Date.now().toString());
 });
 
@@ -349,19 +330,19 @@ client.on('message_create', async (message: Message) => {
             fullMessage = fullMessage ? `${fullMessage}\n\n${fileRefs}` : fileRefs;
         }
 
-        // Write to incoming queue
-        const queueData: QueueData = {
-            channel: 'whatsapp',
-            sender: sender,
-            senderId: message.from,
-            message: fullMessage,
-            timestamp: Date.now(),
-            messageId: messageId,
-            files: downloadedFiles.length > 0 ? downloadedFiles : undefined,
-        };
-
-        const queueFile = path.join(QUEUE_INCOMING, `whatsapp_${messageId}.json`);
-        fs.writeFileSync(queueFile, JSON.stringify(queueData, null, 2));
+        // Write to queue via API
+        await fetch(`${API_BASE}/api/message`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                channel: 'whatsapp',
+                sender,
+                senderId: message.from,
+                message: fullMessage,
+                messageId,
+                files: downloadedFiles.length > 0 ? downloadedFiles : undefined,
+            }),
+        });
 
         log('INFO', `✓ Queued message ${messageId}`);
 
@@ -385,7 +366,7 @@ client.on('message_create', async (message: Message) => {
     }
 });
 
-// Watch for responses in outgoing queue
+// Watch for responses via API
 async function checkOutgoingQueue(): Promise<void> {
     if (processingOutgoingQueue) {
         return;
@@ -394,26 +375,39 @@ async function checkOutgoingQueue(): Promise<void> {
     processingOutgoingQueue = true;
 
     try {
-        const files = fs.readdirSync(QUEUE_OUTGOING)
-            .filter(f => f.startsWith('whatsapp_') && f.endsWith('.json'));
+        const res = await fetch(`${API_BASE}/api/responses/pending?channel=whatsapp`);
+        if (!res.ok) return;
+        const responses = await res.json() as any[];
 
-        for (const file of files) {
-            const filePath = path.join(QUEUE_OUTGOING, file);
-
+        for (const resp of responses) {
             try {
-                const responseData: ResponseData = JSON.parse(fs.readFileSync(filePath, 'utf8'));
-                const { messageId, message: responseText, sender } = responseData;
+                const responseText = resp.message;
+                const messageId = resp.messageId;
+                const sender = resp.sender;
+                const senderId = resp.senderId;
+                const files: string[] = resp.files || [];
 
-                // Find pending message
+                // Find pending message, or fall back to senderId for proactive messages
                 const pending = pendingMessages.get(messageId);
-                if (pending) {
+                let targetChat: Chat | null = pending?.chat ?? null;
+
+                if (!targetChat && senderId) {
+                    try {
+                        const chatId = senderId.includes('@') ? senderId : `${senderId}@c.us`;
+                        targetChat = await client.getChatById(chatId);
+                    } catch (err) {
+                        log('ERROR', `Could not get chat for senderId ${senderId}: ${(err as Error).message}`);
+                    }
+                }
+
+                if (targetChat) {
                     // Send any attached files first
-                    if (responseData.files && responseData.files.length > 0) {
-                        for (const file of responseData.files) {
+                    if (files.length > 0) {
+                        for (const file of files) {
                             try {
                                 if (!fs.existsSync(file)) continue;
                                 const media = MessageMedia.fromFilePath(file);
-                                await pending.chat.sendMessage(media);
+                                await targetChat.sendMessage(media);
                                 log('INFO', `Sent file to WhatsApp: ${path.basename(file)}`);
                             } catch (fileErr) {
                                 log('ERROR', `Failed to send file ${file}: ${(fileErr as Error).message}`);
@@ -423,50 +417,24 @@ async function checkOutgoingQueue(): Promise<void> {
 
                     // Send text response
                     if (responseText) {
-                        pending.message.reply(responseText);
-                    }
-                    log('INFO', `✓ Sent response to ${sender} (${responseText.length} chars${responseData.files ? `, ${responseData.files.length} file(s)` : ''})`);
-
-                    // Clean up
-                    pendingMessages.delete(messageId);
-                    fs.unlinkSync(filePath);
-                } else if (responseData.senderId) {
-                    // Proactive/agent-initiated message — send directly to user
-                    try {
-                        const chatId = responseData.senderId.includes('@') ? responseData.senderId : `${responseData.senderId}@c.us`;
-                        const chat = await client.getChatById(chatId);
-
-                        // Send any attached files first
-                        if (responseData.files && responseData.files.length > 0) {
-                            for (const file of responseData.files) {
-                                try {
-                                    if (!fs.existsSync(file)) continue;
-                                    const media = MessageMedia.fromFilePath(file);
-                                    await chat.sendMessage(media);
-                                    log('INFO', `Sent file to WhatsApp: ${path.basename(file)}`);
-                                } catch (fileErr) {
-                                    log('ERROR', `Failed to send file ${file}: ${(fileErr as Error).message}`);
-                                }
-                            }
+                        if (pending) {
+                            await pending.message.reply(responseText);
+                        } else {
+                            await targetChat.sendMessage(responseText);
                         }
-
-                        // Send text message
-                        if (responseText) {
-                            await chat.sendMessage(responseText);
-                        }
-
-                        log('INFO', `Sent proactive message to ${sender} (${responseText.length} chars${responseData.files ? `, ${responseData.files.length} file(s)` : ''})`);
-                    } catch (chatErr) {
-                        log('ERROR', `Failed to send proactive message to ${responseData.senderId}: ${(chatErr as Error).message}`);
                     }
-                    fs.unlinkSync(filePath);
+
+                    log('INFO', `Sent ${pending ? 'response' : 'proactive message'} to ${sender} (${responseText.length} chars${files.length > 0 ? `, ${files.length} file(s)` : ''})`);
+
+                    if (pending) pendingMessages.delete(messageId);
+                    await fetch(`${API_BASE}/api/responses/${resp.id}/ack`, { method: 'POST' });
                 } else {
-                    log('WARN', `No pending message for ${messageId} and no senderId, cleaning up`);
-                    fs.unlinkSync(filePath);
+                    log('WARN', `No pending message for ${messageId} and no senderId, acking`);
+                    await fetch(`${API_BASE}/api/responses/${resp.id}/ack`, { method: 'POST' });
                 }
             } catch (error) {
-                log('ERROR', `Error processing response file ${file}: ${(error as Error).message}`);
-                // Don't delete file on error, might retry
+                log('ERROR', `Error processing response ${resp.id}: ${(error as Error).message}`);
+                // Don't ack on error, will retry next poll
             }
         }
     } catch (error) {
@@ -489,7 +457,7 @@ client.on('disconnected', (reason: string) => {
     log('WARN', `WhatsApp disconnected: ${reason}`);
 
     // Remove ready flag
-    const readyFile = path.join(SCRIPT_DIR, '.tinyclaw/channels/whatsapp_ready');
+    const readyFile = path.join(TINYCLAW_HOME, 'channels/whatsapp_ready');
     if (fs.existsSync(readyFile)) {
         fs.unlinkSync(readyFile);
     }
@@ -500,7 +468,7 @@ process.on('SIGINT', async () => {
     log('INFO', 'Shutting down WhatsApp client...');
 
     // Remove ready flag
-    const readyFile = path.join(SCRIPT_DIR, '.tinyclaw/channels/whatsapp_ready');
+    const readyFile = path.join(TINYCLAW_HOME, 'channels/whatsapp_ready');
     if (fs.existsSync(readyFile)) {
         fs.unlinkSync(readyFile);
     }
@@ -513,7 +481,7 @@ process.on('SIGTERM', async () => {
     log('INFO', 'Shutting down WhatsApp client...');
 
     // Remove ready flag
-    const readyFile = path.join(SCRIPT_DIR, '.tinyclaw/channels/whatsapp_ready');
+    const readyFile = path.join(TINYCLAW_HOME, 'channels/whatsapp_ready');
     if (fs.existsSync(readyFile)) {
         fs.unlinkSync(readyFile);
     }

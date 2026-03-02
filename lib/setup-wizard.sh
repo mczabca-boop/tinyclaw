@@ -18,26 +18,29 @@ echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━�
 echo ""
 
 # --- Channel registry ---
-# To add a new channel, add its ID here and fill in the config arrays below.
 ALL_CHANNELS=(telegram discord whatsapp)
 
-declare -A CHANNEL_DISPLAY=(
-    [telegram]="Telegram"
-    [discord]="Discord"
-    [whatsapp]="WhatsApp"
-)
-declare -A CHANNEL_TOKEN_KEY=(
-    [discord]="discord_bot_token"
-    [telegram]="telegram_bot_token"
-)
-declare -A CHANNEL_TOKEN_PROMPT=(
-    [discord]="Enter your Discord bot token:"
-    [telegram]="Enter your Telegram bot token:"
-)
-declare -A CHANNEL_TOKEN_HELP=(
-    [discord]="(Get one at: https://discord.com/developers/applications)"
-    [telegram]="(Create a bot via @BotFather on Telegram to get a token)"
-)
+_sw_channel_display() {
+    case "$1" in
+        telegram) echo "Telegram" ;; discord) echo "Discord" ;; whatsapp) echo "WhatsApp" ;;
+    esac
+}
+_sw_channel_token_key() {
+    case "$1" in
+        discord) echo "discord_bot_token" ;; telegram) echo "telegram_bot_token" ;;
+    esac
+}
+_sw_channel_token_prompt() {
+    case "$1" in
+        discord) echo "Enter your Discord bot token:" ;; telegram) echo "Enter your Telegram bot token:" ;;
+    esac
+}
+_sw_channel_token_help() {
+    case "$1" in
+        discord) echo "(Get one at: https://discord.com/developers/applications)" ;;
+        telegram) echo "(Create a bot via @BotFather on Telegram to get a token)" ;;
+    esac
+}
 
 # Channel selection - simple checklist
 echo "Which messaging channels (Telegram, Discord, WhatsApp) do you want to enable?"
@@ -45,10 +48,10 @@ echo ""
 
 ENABLED_CHANNELS=()
 for ch in "${ALL_CHANNELS[@]}"; do
-    read -rp "  Enable ${CHANNEL_DISPLAY[$ch]}? [y/N]: " choice
+    read -rp "  Enable $(_sw_channel_display "$ch")? [y/N]: " choice
     if [[ "$choice" =~ ^[yY] ]]; then
         ENABLED_CHANNELS+=("$ch")
-        echo -e "    ${GREEN}✓ ${CHANNEL_DISPLAY[$ch]} enabled${NC}"
+        echo -e "    ${GREEN}✓ $(_sw_channel_display "$ch") enabled${NC}"
     fi
 done
 echo ""
@@ -59,36 +62,53 @@ if [ ${#ENABLED_CHANNELS[@]} -eq 0 ]; then
 fi
 
 # Collect tokens for channels that need them
-declare -A TOKENS
+# Use parallel arrays for bash 3.2 compatibility
+_TOKEN_CHANNEL_KEYS=()
+_TOKEN_CHANNEL_VALS=()
+
 for ch in "${ENABLED_CHANNELS[@]}"; do
-    token_key="${CHANNEL_TOKEN_KEY[$ch]:-}"
+    token_key="$(_sw_channel_token_key "$ch")"
     if [ -n "$token_key" ]; then
-        echo "${CHANNEL_TOKEN_PROMPT[$ch]}"
-        echo -e "${YELLOW}${CHANNEL_TOKEN_HELP[$ch]}${NC}"
+        echo "$(_sw_channel_token_prompt "$ch")"
+        echo -e "${YELLOW}$(_sw_channel_token_help "$ch")${NC}"
         echo ""
         read -rp "Token: " token_value
 
         if [ -z "$token_value" ]; then
-            echo -e "${RED}${CHANNEL_DISPLAY[$ch]} bot token is required${NC}"
+            echo -e "${RED}$(_sw_channel_display "$ch") bot token is required${NC}"
             exit 1
         fi
-        TOKENS[$ch]="$token_value"
-        echo -e "${GREEN}✓ ${CHANNEL_DISPLAY[$ch]} token saved${NC}"
+        _TOKEN_CHANNEL_KEYS+=("$ch")
+        _TOKEN_CHANNEL_VALS+=("$token_value")
+        echo -e "${GREEN}✓ $(_sw_channel_display "$ch") token saved${NC}"
         echo ""
     fi
 done
+
+# Helper to look up a collected token
+_get_token() {
+    local ch="$1" i
+    for i in "${!_TOKEN_CHANNEL_KEYS[@]}"; do
+        if [ "${_TOKEN_CHANNEL_KEYS[$i]}" = "$ch" ]; then
+            echo "${_TOKEN_CHANNEL_VALS[$i]}"
+            return
+        fi
+    done
+}
 
 # Provider selection
 echo "Which AI provider?"
 echo ""
 echo "  1) Anthropic (Claude)  (recommended)"
 echo "  2) OpenAI (Codex/GPT)"
+echo "  3) OpenCode"
 echo ""
-read -rp "Choose [1-2]: " PROVIDER_CHOICE
+read -rp "Choose [1-3]: " PROVIDER_CHOICE
 
 case "$PROVIDER_CHOICE" in
     1) PROVIDER="anthropic" ;;
     2) PROVIDER="openai" ;;
+    3) PROVIDER="opencode" ;;
     *)
         echo -e "${RED}Invalid choice${NC}"
         exit 1
@@ -103,16 +123,56 @@ if [ "$PROVIDER" = "anthropic" ]; then
     echo ""
     echo "  1) Sonnet  (fast, recommended)"
     echo "  2) Opus    (smartest)"
+    echo "  3) Custom  (enter model name)"
     echo ""
-    read -rp "Choose [1-2]: " MODEL_CHOICE
+    read -rp "Choose [1-3]: " MODEL_CHOICE
 
     case "$MODEL_CHOICE" in
         1) MODEL="sonnet" ;;
         2) MODEL="opus" ;;
+        3)
+            read -rp "Enter model name: " MODEL
+            if [ -z "$MODEL" ]; then
+                echo -e "${RED}Model name required${NC}"
+                exit 1
+            fi
+            ;;
         *)
             echo -e "${RED}Invalid choice${NC}"
             exit 1
             ;;
+    esac
+    echo -e "${GREEN}✓ Model: $MODEL${NC}"
+    echo ""
+elif [ "$PROVIDER" = "opencode" ]; then
+    echo "Which OpenCode model? (provider/model format)"
+    echo ""
+    echo "  1) opencode/claude-sonnet-4-5  (recommended)"
+    echo "  2) opencode/claude-opus-4-6"
+    echo "  3) opencode/gemini-3-flash"
+    echo "  4) opencode/gemini-3-pro"
+    echo "  5) anthropic/claude-sonnet-4-5"
+    echo "  6) anthropic/claude-opus-4-6"
+    echo "  7) openai/gpt-5.3-codex"
+    echo "  8) Custom  (enter model name)"
+    echo ""
+    read -rp "Choose [1-8, default: 1]: " MODEL_CHOICE
+
+    case "$MODEL_CHOICE" in
+        2) MODEL="opencode/claude-opus-4-6" ;;
+        3) MODEL="opencode/gemini-3-flash" ;;
+        4) MODEL="opencode/gemini-3-pro" ;;
+        5) MODEL="anthropic/claude-sonnet-4-5" ;;
+        6) MODEL="anthropic/claude-opus-4-6" ;;
+        7) MODEL="openai/gpt-5.3-codex" ;;
+        8)
+            read -rp "Enter model name (e.g. provider/model): " MODEL
+            if [ -z "$MODEL" ]; then
+                echo -e "${RED}Model name required${NC}"
+                exit 1
+            fi
+            ;;
+        *) MODEL="opencode/claude-sonnet-4-5" ;;
     esac
     echo -e "${GREEN}✓ Model: $MODEL${NC}"
     echo ""
@@ -122,12 +182,20 @@ else
     echo ""
     echo "  1) GPT-5.3 Codex  (recommended)"
     echo "  2) GPT-5.2"
+    echo "  3) Custom  (enter model name)"
     echo ""
-    read -rp "Choose [1-2]: " MODEL_CHOICE
+    read -rp "Choose [1-3]: " MODEL_CHOICE
 
     case "$MODEL_CHOICE" in
         1) MODEL="gpt-5.3-codex" ;;
         2) MODEL="gpt-5.2" ;;
+        3)
+            read -rp "Enter model name: " MODEL
+            if [ -z "$MODEL" ]; then
+                echo -e "${RED}Model name required${NC}"
+                exit 1
+            fi
+            ;;
         *)
             echo -e "${RED}Invalid choice${NC}"
             exit 1
@@ -158,8 +226,12 @@ echo ""
 read -rp "Workspace name [default: tinyclaw-workspace]: " WORKSPACE_INPUT
 WORKSPACE_NAME=${WORKSPACE_INPUT:-tinyclaw-workspace}
 # Clean workspace name
-WORKSPACE_NAME=$(echo "$WORKSPACE_NAME" | tr ' ' '-' | tr -cd 'a-zA-Z0-9_-')
-WORKSPACE_PATH="$HOME/$WORKSPACE_NAME"
+WORKSPACE_NAME=$(echo "$WORKSPACE_NAME" | tr ' ' '-' | tr -cd 'a-zA-Z0-9_/~.-')
+if [[ "$WORKSPACE_NAME" == /* || "$WORKSPACE_NAME" == ~* ]]; then
+  WORKSPACE_PATH="${WORKSPACE_NAME/#\~/$HOME}"
+else
+  WORKSPACE_PATH="$HOME/$WORKSPACE_NAME"
+fi
 echo -e "${GREEN}✓ Workspace: $WORKSPACE_PATH${NC}"
 echo ""
 
@@ -216,25 +288,38 @@ if [[ "$SETUP_AGENTS" =~ ^[yY] ]]; then
         read -rp "  Display name: " NEW_AGENT_NAME
         [ -z "$NEW_AGENT_NAME" ] && NEW_AGENT_NAME="$NEW_AGENT_ID"
 
-        echo "  Provider: 1) Anthropic  2) OpenAI"
-        read -rp "  Choose [1-2, default: 1]: " NEW_PROVIDER_CHOICE
+        echo "  Provider: 1) Anthropic  2) OpenAI  3) OpenCode"
+        read -rp "  Choose [1-3, default: 1]: " NEW_PROVIDER_CHOICE
         case "$NEW_PROVIDER_CHOICE" in
             2) NEW_PROVIDER="openai" ;;
+            3) NEW_PROVIDER="opencode" ;;
             *) NEW_PROVIDER="anthropic" ;;
         esac
 
         if [ "$NEW_PROVIDER" = "anthropic" ]; then
-            echo "  Model: 1) Sonnet  2) Opus"
-            read -rp "  Choose [1-2, default: 1]: " NEW_MODEL_CHOICE
+            echo "  Model: 1) Sonnet  2) Opus  3) Custom"
+            read -rp "  Choose [1-3, default: 1]: " NEW_MODEL_CHOICE
             case "$NEW_MODEL_CHOICE" in
                 2) NEW_MODEL="opus" ;;
+                3) read -rp "  Enter model name: " NEW_MODEL ;;
                 *) NEW_MODEL="sonnet" ;;
             esac
+        elif [ "$NEW_PROVIDER" = "opencode" ]; then
+            echo "  Model: 1) opencode/claude-sonnet-4-5  2) opencode/claude-opus-4-6  3) opencode/gemini-3-flash  4) anthropic/claude-sonnet-4-5  5) Custom"
+            read -rp "  Choose [1-5, default: 1]: " NEW_MODEL_CHOICE
+            case "$NEW_MODEL_CHOICE" in
+                2) NEW_MODEL="opencode/claude-opus-4-6" ;;
+                3) NEW_MODEL="opencode/gemini-3-flash" ;;
+                4) NEW_MODEL="anthropic/claude-sonnet-4-5" ;;
+                5) read -rp "  Enter model name (e.g. provider/model): " NEW_MODEL ;;
+                *) NEW_MODEL="opencode/claude-sonnet-4-5" ;;
+            esac
         else
-            echo "  Model: 1) GPT-5.3 Codex  2) GPT-5.2"
-            read -rp "  Choose [1-2, default: 1]: " NEW_MODEL_CHOICE
+            echo "  Model: 1) GPT-5.3 Codex  2) GPT-5.2  3) Custom"
+            read -rp "  Choose [1-3, default: 1]: " NEW_MODEL_CHOICE
             case "$NEW_MODEL_CHOICE" in
                 2) NEW_MODEL="gpt-5.2" ;;
+                3) read -rp "  Enter model name: " NEW_MODEL ;;
                 *) NEW_MODEL="gpt-5.3-codex" ;;
             esac
         fi
@@ -263,13 +348,15 @@ done
 CHANNELS_JSON="${CHANNELS_JSON}]"
 
 # Build channel configs with tokens
-DISCORD_TOKEN="${TOKENS[discord]:-}"
-TELEGRAM_TOKEN="${TOKENS[telegram]:-}"
+DISCORD_TOKEN="$(_get_token discord)"
+TELEGRAM_TOKEN="$(_get_token telegram)"
 
 # Write settings.json with layered structure
 # Use jq to build valid JSON to avoid escaping issues with agent prompts
 if [ "$PROVIDER" = "anthropic" ]; then
     MODELS_SECTION='"models": { "provider": "anthropic", "anthropic": { "model": "'"${MODEL}"'" } }'
+elif [ "$PROVIDER" = "opencode" ]; then
+    MODELS_SECTION='"models": { "provider": "opencode", "opencode": { "model": "'"${MODEL}"'" } }'
 else
     MODELS_SECTION='"models": { "provider": "openai", "openai": { "model": "'"${MODEL}"'" } }'
 fi

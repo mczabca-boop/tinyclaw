@@ -1,25 +1,7 @@
 #!/usr/bin/env bash
 # Common utilities and configuration for TinyClaw
 # Sourced by main tinyclaw.sh script
-
-# Check bash version (need 4.0+ for associative arrays)
-if [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
-    echo "Error: This script requires bash 4.0 or higher (you have ${BASH_VERSION})"
-    echo ""
-    if [[ "$OSTYPE" == "darwin"* ]]; then
-        echo "macOS ships with bash 3.2. Install a newer version:"
-        echo "  brew install bash"
-        echo ""
-        echo "Then either:"
-        echo "  1. Run with: /opt/homebrew/bin/bash $0"
-        echo "  2. Add to your PATH: export PATH=\"/opt/homebrew/bin:\$PATH\""
-    else
-        echo "Install bash 4.0+ using your package manager:"
-        echo "  Ubuntu/Debian: sudo apt-get install bash"
-        echo "  CentOS/RHEL: sudo yum install bash"
-    fi
-    exit 1
-fi
+# Compatible with bash 3.2+ (no associative arrays)
 
 # Colors
 GREEN='\033[0;32m'
@@ -33,34 +15,76 @@ NC='\033[0m'
 
 ALL_CHANNELS=(discord whatsapp telegram)
 
-declare -A CHANNEL_DISPLAY=(
-    [discord]="Discord"
-    [whatsapp]="WhatsApp"
-    [telegram]="Telegram"
-)
-declare -A CHANNEL_SCRIPT=(
-    [discord]="dist/channels/discord-client.js"
-    [whatsapp]="dist/channels/whatsapp-client.js"
-    [telegram]="dist/channels/telegram-client.js"
-)
-declare -A CHANNEL_ALIAS=(
-    [discord]="dc"
-    [whatsapp]="wa"
-    [telegram]="tg"
-)
-declare -A CHANNEL_TOKEN_KEY=(
-    [discord]="discord_bot_token"
-    [telegram]="telegram_bot_token"
-)
-declare -A CHANNEL_TOKEN_ENV=(
-    [discord]="DISCORD_BOT_TOKEN"
-    [telegram]="TELEGRAM_BOT_TOKEN"
-)
+# Channel lookup functions (bash 3.2 compatible, no associative arrays)
+channel_display() {
+    case "$1" in
+        discord)  echo "Discord" ;;
+        whatsapp) echo "WhatsApp" ;;
+        telegram) echo "Telegram" ;;
+    esac
+}
+
+channel_script() {
+    case "$1" in
+        discord)  echo "dist/channels/discord-client.js" ;;
+        whatsapp) echo "dist/channels/whatsapp-client.js" ;;
+        telegram) echo "dist/channels/telegram-client.js" ;;
+    esac
+}
+
+channel_alias() {
+    case "$1" in
+        discord)  echo "dc" ;;
+        whatsapp) echo "wa" ;;
+        telegram) echo "tg" ;;
+    esac
+}
+
+channel_token_key() {
+    case "$1" in
+        discord)  echo "discord_bot_token" ;;
+        telegram) echo "telegram_bot_token" ;;
+    esac
+}
+
+channel_token_env() {
+    case "$1" in
+        discord)  echo "DISCORD_BOT_TOKEN" ;;
+        telegram) echo "TELEGRAM_BOT_TOKEN" ;;
+    esac
+}
 
 # Runtime state: filled by load_settings
 ACTIVE_CHANNELS=()
-declare -A CHANNEL_TOKENS=()
 WORKSPACE_PATH=""
+
+# Per-channel token storage (parallel array, bash 3.2 compatible)
+_CHANNEL_TOKEN_KEYS=()
+_CHANNEL_TOKEN_VALS=()
+
+_set_channel_token() {
+    local ch="$1" val="$2"
+    local i
+    for i in "${!_CHANNEL_TOKEN_KEYS[@]}"; do
+        if [ "${_CHANNEL_TOKEN_KEYS[$i]}" = "$ch" ]; then
+            _CHANNEL_TOKEN_VALS[$i]="$val"
+            return
+        fi
+    done
+    _CHANNEL_TOKEN_KEYS+=("$ch")
+    _CHANNEL_TOKEN_VALS+=("$val")
+}
+
+get_channel_token() {
+    local ch="$1"
+    local i
+    for i in "${!_CHANNEL_TOKEN_KEYS[@]}"; do
+        if [ "${_CHANNEL_TOKEN_KEYS[$i]}" = "$ch" ]; then
+            echo "${_CHANNEL_TOKEN_VALS[$i]}"
+            return
+        fi
+    done
+}
 
 # Logging function
 log() {
@@ -68,6 +92,7 @@ log() {
 }
 
 # Load settings from JSON
+# Returns: 0 = success, 1 = file not found / no config, 2 = invalid JSON
 load_settings() {
     if [ ! -f "$SETTINGS_FILE" ]; then
         return 1
@@ -78,6 +103,11 @@ load_settings() {
         echo -e "${RED}Error: jq is required for parsing settings${NC}"
         echo "Install with: brew install jq (macOS) or apt-get install jq (Linux)"
         return 1
+    fi
+
+    # Validate JSON syntax before attempting to parse
+    if ! jq empty "$SETTINGS_FILE" 2>/dev/null; then
+        return 2
     fi
 
     # Load workspace path
@@ -103,9 +133,12 @@ load_settings() {
 
     # Load tokens for each channel from nested structure
     for ch in "${ALL_CHANNELS[@]}"; do
-        local token_key="${CHANNEL_TOKEN_KEY[$ch]:-}"
+        local token_key
+        token_key="$(channel_token_key "$ch")"
         if [ -n "$token_key" ]; then
-            CHANNEL_TOKENS[$ch]=$(jq -r ".channels.${ch}.bot_token // empty" "$SETTINGS_FILE" 2>/dev/null)
+            local token_val
+            token_val=$(jq -r ".channels.${ch}.bot_token // empty" "$SETTINGS_FILE" 2>/dev/null)
+            _set_channel_token "$ch" "$token_val"
         fi
     done
 

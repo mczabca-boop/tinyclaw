@@ -38,7 +38,38 @@ start_daemon() {
     fi
 
     # Load settings or run setup wizard
-    if ! load_settings; then
+    load_settings
+    local load_rc=$?
+
+    if [ $load_rc -eq 2 ]; then
+        # JSON file exists but contains invalid JSON
+        echo -e "${RED}Error: settings.json exists but contains invalid JSON${NC}"
+        echo ""
+        local jq_err
+        jq_err=$(jq empty "$SETTINGS_FILE" 2>&1)
+        echo -e "  ${YELLOW}${jq_err}${NC}"
+        echo ""
+
+        # Attempt auto-fix using jsonrepair (npm package)
+        echo -e "${YELLOW}Attempting to auto-fix...${NC}"
+        local repair_output
+        repair_output=$(node -e 'const{jsonrepair}=require("jsonrepair");const fs=require("fs");try{const raw=fs.readFileSync(process.argv[1],"utf8");const fixed=jsonrepair(raw);JSON.parse(fixed);fs.copyFileSync(process.argv[1],process.argv[1]+".bak");fs.writeFileSync(process.argv[1],JSON.stringify(JSON.parse(fixed),null,2)+"\n");console.log("ok")}catch(e){console.error(e.message);process.exit(1)}' "$SETTINGS_FILE" 2>&1)
+
+        if [ $? -eq 0 ]; then
+            echo -e "  ${GREEN}✓ JSON auto-fixed successfully${NC}"
+            echo -e "  Backup saved to ${SETTINGS_FILE}.bak"
+            echo ""
+            load_settings
+            load_rc=$?
+        fi
+
+        if [ $load_rc -ne 0 ]; then
+            echo -e "${RED}Could not repair settings.json${NC}"
+            echo "  Fix manually: $SETTINGS_FILE"
+            echo "  Or reconfigure: tinyclaw setup"
+            return 1
+        fi
+    elif [ $load_rc -ne 0 ]; then
         echo -e "${YELLOW}No configuration found. Running setup wizard...${NC}"
         echo ""
         "$SCRIPT_DIR/lib/setup-wizard.sh"
@@ -59,9 +90,10 @@ start_daemon() {
 
     # Validate tokens for channels that need them
     for ch in "${ACTIVE_CHANNELS[@]}"; do
-        local token_key="${CHANNEL_TOKEN_KEY[$ch]:-}"
-        if [ -n "$token_key" ] && [ -z "${CHANNEL_TOKENS[$ch]:-}" ]; then
-            echo -e "${RED}${CHANNEL_DISPLAY[$ch]} is configured but bot token is missing${NC}"
+        local token_key
+        token_key="$(channel_token_key "$ch")"
+        if [ -n "$token_key" ] && [ -z "$(get_channel_token "$ch")" ]; then
+            echo -e "${RED}$(channel_display "$ch") is configured but bot token is missing${NC}"
             echo "Run 'tinyclaw setup' to reconfigure"
             return 1
         fi
@@ -71,9 +103,12 @@ start_daemon() {
     local env_file="$SCRIPT_DIR/.env"
     : > "$env_file"
     for ch in "${ACTIVE_CHANNELS[@]}"; do
-        local env_var="${CHANNEL_TOKEN_ENV[$ch]:-}"
-        if [ -n "$env_var" ] && [ -n "${CHANNEL_TOKENS[$ch]:-}" ]; then
-            echo "${env_var}=${CHANNEL_TOKENS[$ch]}" >> "$env_file"
+        local env_var
+        env_var="$(channel_token_env "$ch")"
+        local token_val
+        token_val="$(get_channel_token "$ch")"
+        if [ -n "$env_var" ] && [ -n "$token_val" ]; then
+            echo "${env_var}=${token_val}" >> "$env_file"
         fi
     done
 
@@ -88,7 +123,7 @@ start_daemon() {
     # Report channels
     echo -e "${BLUE}Channels:${NC}"
     for ch in "${ACTIVE_CHANNELS[@]}"; do
-        echo -e "  ${GREEN}✓${NC} ${CHANNEL_DISPLAY[$ch]}"
+        echo -e "  ${GREEN}✓${NC} $(channel_display "$ch")"
     done
     echo ""
 
@@ -104,35 +139,41 @@ start_daemon() {
 
     tmux new-session -d -s "$TMUX_SESSION" -n "tinyclaw" -c "$SCRIPT_DIR"
 
-    # Create remaining panes (pane 0 already exists)
+    # Detect tmux base indices (user may have base-index or pane-base-index set)
+    local win_base
+    win_base=$(tmux show-option -gv base-index 2>/dev/null || echo 0)
+    local pane_base
+    pane_base=$(tmux show-option -gv pane-base-index 2>/dev/null || echo 0)
+
+    # Create remaining panes (first pane already exists)
     for ((i=1; i<total_panes; i++)); do
         tmux split-window -t "$TMUX_SESSION" -c "$SCRIPT_DIR"
         tmux select-layout -t "$TMUX_SESSION" tiled  # rebalance after each split
     done
 
     # Assign channel panes
-    local pane_idx=0
+    local pane_idx=$pane_base
     local whatsapp_pane=-1
     for ch in "${ACTIVE_CHANNELS[@]}"; do
         [ "$ch" = "whatsapp" ] && whatsapp_pane=$pane_idx
-        tmux send-keys -t "$TMUX_SESSION:0.$pane_idx" "cd '$SCRIPT_DIR' && node ${CHANNEL_SCRIPT[$ch]}" C-m
-        tmux select-pane -t "$TMUX_SESSION:0.$pane_idx" -T "${CHANNEL_DISPLAY[$ch]}"
+        tmux send-keys -t "$TMUX_SESSION:${win_base}.$pane_idx" "cd '$SCRIPT_DIR' && node $(channel_script "$ch")" C-m
+        tmux select-pane -t "$TMUX_SESSION:${win_base}.$pane_idx" -T "$(channel_display "$ch")"
         pane_idx=$((pane_idx + 1))
     done
 
     # Queue pane
-    tmux send-keys -t "$TMUX_SESSION:0.$pane_idx" "cd '$SCRIPT_DIR' && node dist/queue-processor.js" C-m
-    tmux select-pane -t "$TMUX_SESSION:0.$pane_idx" -T "Queue"
+    tmux send-keys -t "$TMUX_SESSION:${win_base}.$pane_idx" "cd '$SCRIPT_DIR' && node dist/queue-processor.js" C-m
+    tmux select-pane -t "$TMUX_SESSION:${win_base}.$pane_idx" -T "Queue"
     pane_idx=$((pane_idx + 1))
 
     # Heartbeat pane
-    tmux send-keys -t "$TMUX_SESSION:0.$pane_idx" "cd '$SCRIPT_DIR' && ./lib/heartbeat-cron.sh" C-m
-    tmux select-pane -t "$TMUX_SESSION:0.$pane_idx" -T "Heartbeat"
+    tmux send-keys -t "$TMUX_SESSION:${win_base}.$pane_idx" "cd '$SCRIPT_DIR' && ./lib/heartbeat-cron.sh" C-m
+    tmux select-pane -t "$TMUX_SESSION:${win_base}.$pane_idx" -T "Heartbeat"
     pane_idx=$((pane_idx + 1))
 
     # Logs pane
-    tmux send-keys -t "$TMUX_SESSION:0.$pane_idx" "cd '$SCRIPT_DIR' && $log_tail_cmd" C-m
-    tmux select-pane -t "$TMUX_SESSION:0.$pane_idx" -T "Logs"
+    tmux send-keys -t "$TMUX_SESSION:${win_base}.$pane_idx" "cd '$SCRIPT_DIR' && $log_tail_cmd" C-m
+    tmux select-pane -t "$TMUX_SESSION:${win_base}.$pane_idx" -T "Logs"
 
     echo ""
     echo -e "${GREEN}✓ TinyClaw started${NC}"
@@ -143,8 +184,8 @@ start_daemon() {
         echo -e "${YELLOW}Starting WhatsApp client...${NC}"
         echo ""
 
-        QR_FILE="$SCRIPT_DIR/.tinyclaw/channels/whatsapp_qr.txt"
-        READY_FILE="$SCRIPT_DIR/.tinyclaw/channels/whatsapp_ready"
+        QR_FILE="$TINYCLAW_HOME/channels/whatsapp_qr.txt"
+        READY_FILE="$TINYCLAW_HOME/channels/whatsapp_ready"
         QR_DISPLAYED=false
 
         for i in {1..60}; do
@@ -228,7 +269,7 @@ stop_daemon() {
 
     # Kill any remaining channel processes
     for ch in "${ALL_CHANNELS[@]}"; do
-        pkill -f "${CHANNEL_SCRIPT[$ch]}" || true
+        pkill -f "$(channel_script "$ch")" || true
     done
     pkill -f "dist/queue-processor.js" || true
     pkill -f "heartbeat-cron.sh" || true
@@ -274,11 +315,13 @@ status_daemon() {
     echo ""
 
     # Channel process status
-    local ready_file="$SCRIPT_DIR/.tinyclaw/channels/whatsapp_ready"
+    local ready_file="$TINYCLAW_HOME/channels/whatsapp_ready"
 
     for ch in "${ALL_CHANNELS[@]}"; do
-        local display="${CHANNEL_DISPLAY[$ch]}"
-        local script="${CHANNEL_SCRIPT[$ch]}"
+        local display
+        display="$(channel_display "$ch")"
+        local script
+        script="$(channel_script "$ch")"
         local pad=""
         # Pad display name to align output
         while [ $((${#display} + ${#pad})) -lt 16 ]; do pad="$pad "; done
@@ -313,7 +356,7 @@ status_daemon() {
     for ch in "${ALL_CHANNELS[@]}"; do
         if [ -f "$LOG_DIR/${ch}.log" ]; then
             echo ""
-            echo "Recent ${CHANNEL_DISPLAY[$ch]} Activity:"
+            echo "Recent $(channel_display "$ch") Activity:"
             printf '%0.s─' {1..24}; echo ""
             tail -n 5 "$LOG_DIR/${ch}.log"
         fi
@@ -327,7 +370,8 @@ status_daemon() {
     echo ""
     echo "Logs:"
     for ch in "${ALL_CHANNELS[@]}"; do
-        local display="${CHANNEL_DISPLAY[$ch]}"
+        local display
+        display="$(channel_display "$ch")"
         local pad=""
         while [ $((${#display} + ${#pad})) -lt 10 ]; do pad="$pad "; done
         echo "  ${display}:${pad}tail -f $LOG_DIR/${ch}.log"

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC1091
 # TinyClaw - Main daemon using tmux + claude -c -p + messaging channels
 #
 # To add a new channel:
@@ -7,20 +8,23 @@
 #   3. Fill in the CHANNEL_* registry arrays in lib/common.sh
 #   4. Run setup wizard to enable it
 
-# Use TINYCLAW_HOME if set (for CLI wrapper), otherwise detect from script location
-if [ -n "$TINYCLAW_HOME" ]; then
-    SCRIPT_DIR="$TINYCLAW_HOME"
-else
-    SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# SCRIPT_DIR = repo root (where bash scripts live)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# TINYCLAW_HOME = data directory (settings, queue, logs, etc.)
+# - Installed CLI sets this to ~/.tinyclaw via bin/tinyclaw
+# - Local dev: detect from local .tinyclaw/ or fall back to ~/.tinyclaw
+if [ -z "$TINYCLAW_HOME" ]; then
+    if [ -f "$SCRIPT_DIR/.tinyclaw/settings.json" ]; then
+        TINYCLAW_HOME="$SCRIPT_DIR/.tinyclaw"
+    else
+        TINYCLAW_HOME="$HOME/.tinyclaw"
+    fi
 fi
+
 TMUX_SESSION="tinyclaw"
-# Centralize all logs to ~/.tinyclaw/logs
-LOG_DIR="$HOME/.tinyclaw/logs"
-if [ -f "$SCRIPT_DIR/.tinyclaw/settings.json" ]; then
-    SETTINGS_FILE="$SCRIPT_DIR/.tinyclaw/settings.json"
-else
-    SETTINGS_FILE="$HOME/.tinyclaw/settings.json"
-fi
+LOG_DIR="$TINYCLAW_HOME/logs"
+SETTINGS_FILE="$TINYCLAW_HOME/settings.json"
 
 mkdir -p "$LOG_DIR"
 
@@ -95,9 +99,20 @@ case "${1:-}" in
                 else
                     CURRENT_MODEL=$(jq -r '.models.anthropic.model // empty' "$SETTINGS_FILE" 2>/dev/null)
                 fi
-                echo -e "${BLUE}Current provider: ${GREEN}$CURRENT_PROVIDER${NC}"
                 if [ -n "$CURRENT_MODEL" ]; then
-                    echo -e "${BLUE}Current model: ${GREEN}$CURRENT_MODEL${NC}"
+                    echo -e "${BLUE}Global default: ${GREEN}${CURRENT_PROVIDER}/${CURRENT_MODEL}${NC}"
+                else
+                    echo -e "${BLUE}Global default: ${GREEN}$CURRENT_PROVIDER${NC}"
+                fi
+
+                # Show per-agent breakdown if agents exist
+                AGENT_COUNT=$(jq -r '.agents // {} | length' "$SETTINGS_FILE" 2>/dev/null)
+                if [ "$AGENT_COUNT" -gt 0 ] 2>/dev/null; then
+                    echo ""
+                    echo -e "${BLUE}Per-agent models:${NC}"
+                    jq -r '.agents // {} | to_entries[] | "  @\(.key): \(.value.provider)/\(.value.model)"' "$SETTINGS_FILE" 2>/dev/null | while IFS= read -r line; do
+                        echo -e "  ${GREEN}${line}${NC}"
+                    done
                 fi
             else
                 echo -e "${RED}No settings file found${NC}"
@@ -111,6 +126,9 @@ case "${1:-}" in
                 MODEL_ARG="$4"
             fi
 
+            # Capture old provider before switching (for agent propagation)
+            OLD_PROVIDER=$(jq -r '.models.provider // "anthropic"' "$SETTINGS_FILE" 2>/dev/null)
+
             case "$PROVIDER_ARG" in
                 anthropic)
                     if [ ! -f "$SETTINGS_FILE" ]; then
@@ -121,12 +139,24 @@ case "${1:-}" in
                     # Switch to Anthropic provider
                     tmp_file="$SETTINGS_FILE.tmp"
                     if [ -n "$MODEL_ARG" ]; then
-                        # Set both provider and model
-                        jq ".models.provider = \"anthropic\" | .models.anthropic.model = \"$MODEL_ARG\"" "$SETTINGS_FILE" > "$tmp_file" && mv "$tmp_file" "$SETTINGS_FILE"
+                        # Count agents to update before mutation
+                        UPDATED_COUNT=$(jq --arg old_provider "$OLD_PROVIDER" '[.agents // {} | to_entries[] | select(.value.provider == $old_provider)] | length' "$SETTINGS_FILE" 2>/dev/null)
+                        # Set global default and propagate to agents matching old provider
+                        jq --arg model "$MODEL_ARG" --arg old_provider "$OLD_PROVIDER" '
+                            .models.provider = "anthropic" |
+                            .models.anthropic.model = $model |
+                            .agents //= {} |
+                            .agents |= with_entries(
+                                if .value.provider == $old_provider then .value.provider = "anthropic" | .value.model = $model else . end
+                            )
+                        ' "$SETTINGS_FILE" > "$tmp_file" && mv "$tmp_file" "$SETTINGS_FILE"
                         echo -e "${GREEN}✓ Switched to Anthropic provider with model: $MODEL_ARG${NC}"
+                        if [ "$UPDATED_COUNT" -gt 0 ] 2>/dev/null; then
+                            echo -e "${BLUE}  Updated $UPDATED_COUNT agent(s) from $OLD_PROVIDER to anthropic/$MODEL_ARG${NC}"
+                        fi
                     else
-                        # Set provider only
-                        jq ".models.provider = \"anthropic\"" "$SETTINGS_FILE" > "$tmp_file" && mv "$tmp_file" "$SETTINGS_FILE"
+                        # Set provider only (no agent propagation)
+                        jq '.models.provider = "anthropic"' "$SETTINGS_FILE" > "$tmp_file" && mv "$tmp_file" "$SETTINGS_FILE"
                         echo -e "${GREEN}✓ Switched to Anthropic provider${NC}"
                         echo ""
                         echo "Use 'tinyclaw model {sonnet|opus}' to set the model."
@@ -141,14 +171,26 @@ case "${1:-}" in
                     # Switch to OpenAI provider (using Codex CLI)
                     tmp_file="$SETTINGS_FILE.tmp"
                     if [ -n "$MODEL_ARG" ]; then
-                        # Set both provider and model (supports any model name)
-                        jq ".models.provider = \"openai\" | .models.openai.model = \"$MODEL_ARG\"" "$SETTINGS_FILE" > "$tmp_file" && mv "$tmp_file" "$SETTINGS_FILE"
+                        # Count agents to update before mutation
+                        UPDATED_COUNT=$(jq --arg old_provider "$OLD_PROVIDER" '[.agents // {} | to_entries[] | select(.value.provider == $old_provider)] | length' "$SETTINGS_FILE" 2>/dev/null)
+                        # Set global default and propagate to agents matching old provider
+                        jq --arg model "$MODEL_ARG" --arg old_provider "$OLD_PROVIDER" '
+                            .models.provider = "openai" |
+                            .models.openai.model = $model |
+                            .agents //= {} |
+                            .agents |= with_entries(
+                                if .value.provider == $old_provider then .value.provider = "openai" | .value.model = $model else . end
+                            )
+                        ' "$SETTINGS_FILE" > "$tmp_file" && mv "$tmp_file" "$SETTINGS_FILE"
                         echo -e "${GREEN}✓ Switched to OpenAI/Codex provider with model: $MODEL_ARG${NC}"
+                        if [ "$UPDATED_COUNT" -gt 0 ] 2>/dev/null; then
+                            echo -e "${BLUE}  Updated $UPDATED_COUNT agent(s) from $OLD_PROVIDER to openai/$MODEL_ARG${NC}"
+                        fi
                         echo ""
                         echo "Note: Make sure you have the 'codex' CLI installed and authenticated."
                     else
-                        # Set provider only
-                        jq ".models.provider = \"openai\"" "$SETTINGS_FILE" > "$tmp_file" && mv "$tmp_file" "$SETTINGS_FILE"
+                        # Set provider only (no agent propagation)
+                        jq '.models.provider = "openai"' "$SETTINGS_FILE" > "$tmp_file" && mv "$tmp_file" "$SETTINGS_FILE"
                         echo -e "${GREEN}✓ Switched to OpenAI/Codex provider${NC}"
                         echo ""
                         echo "Use 'tinyclaw model {gpt-5.3-codex|gpt-5.2}' to set the model."
@@ -180,11 +222,20 @@ case "${1:-}" in
                     CURRENT_MODEL=$(jq -r '.models.anthropic.model // empty' "$SETTINGS_FILE" 2>/dev/null)
                 fi
                 if [ -n "$CURRENT_MODEL" ]; then
-                    echo -e "${BLUE}Current provider: ${GREEN}$CURRENT_PROVIDER${NC}"
-                    echo -e "${BLUE}Current model: ${GREEN}$CURRENT_MODEL${NC}"
+                    echo -e "${BLUE}Global default: ${GREEN}${CURRENT_PROVIDER}/${CURRENT_MODEL}${NC}"
                 else
                     echo -e "${RED}No model configured${NC}"
                     exit 1
+                fi
+
+                # Show per-agent breakdown if agents exist
+                AGENT_COUNT=$(jq -r '.agents // {} | length' "$SETTINGS_FILE" 2>/dev/null)
+                if [ "$AGENT_COUNT" -gt 0 ] 2>/dev/null; then
+                    echo ""
+                    echo -e "${BLUE}Per-agent models:${NC}"
+                    jq -r '.agents // {} | to_entries[] | "  @\(.key): \(.value.provider)/\(.value.model)"' "$SETTINGS_FILE" 2>/dev/null | while IFS= read -r line; do
+                        echo -e "  ${GREEN}${line}${NC}"
+                    done
                 fi
             else
                 echo -e "${RED}No settings file found${NC}"
@@ -198,13 +249,23 @@ case "${1:-}" in
                         exit 1
                     fi
 
-                    # Update model using jq
+                    # Update global default and propagate to all anthropic agents
                     tmp_file="$SETTINGS_FILE.tmp"
-                    jq ".models.anthropic.model = \"$2\"" "$SETTINGS_FILE" > "$tmp_file" && mv "$tmp_file" "$SETTINGS_FILE"
+                    jq --arg model "$2" '
+                        .models.anthropic.model = $model |
+                        .agents //= {} |
+                        .agents |= with_entries(
+                            if .value.provider == "anthropic" then .value.model = $model else . end
+                        )
+                    ' "$SETTINGS_FILE" > "$tmp_file" && mv "$tmp_file" "$SETTINGS_FILE"
 
+                    UPDATED_COUNT=$(jq --arg model "$2" '[.agents // {} | to_entries[] | select(.value.provider == "anthropic")] | length' "$SETTINGS_FILE" 2>/dev/null)
                     echo -e "${GREEN}✓ Model switched to: $2${NC}"
+                    if [ "$UPDATED_COUNT" -gt 0 ] 2>/dev/null; then
+                        echo -e "${BLUE}  Updated $UPDATED_COUNT anthropic agent(s)${NC}"
+                    fi
                     echo ""
-                    echo "Note: This affects the queue processor. Changes take effect on next message."
+                    echo "Note: Changes take effect on next message."
                     ;;
                 gpt-5.2|gpt-5.3-codex)
                     if [ ! -f "$SETTINGS_FILE" ]; then
@@ -212,13 +273,23 @@ case "${1:-}" in
                         exit 1
                     fi
 
-                    # Update model using jq
+                    # Update global default and propagate to all openai agents
                     tmp_file="$SETTINGS_FILE.tmp"
-                    jq ".models.openai.model = \"$2\"" "$SETTINGS_FILE" > "$tmp_file" && mv "$tmp_file" "$SETTINGS_FILE"
+                    jq --arg model "$2" '
+                        .models.openai.model = $model |
+                        .agents //= {} |
+                        .agents |= with_entries(
+                            if .value.provider == "openai" then .value.model = $model else . end
+                        )
+                    ' "$SETTINGS_FILE" > "$tmp_file" && mv "$tmp_file" "$SETTINGS_FILE"
 
+                    UPDATED_COUNT=$(jq --arg model "$2" '[.agents // {} | to_entries[] | select(.value.provider == "openai")] | length' "$SETTINGS_FILE" 2>/dev/null)
                     echo -e "${GREEN}✓ Model switched to: $2${NC}"
+                    if [ "$UPDATED_COUNT" -gt 0 ] 2>/dev/null; then
+                        echo -e "${BLUE}  Updated $UPDATED_COUNT openai agent(s)${NC}"
+                    fi
                     echo ""
-                    echo "Note: This affects the queue processor. Changes take effect on next message."
+                    echo "Note: Changes take effect on next message."
                     ;;
                 *)
                     echo "Usage: $0 model {sonnet|opus|gpt-5.2|gpt-5.3-codex}"
@@ -270,8 +341,22 @@ case "${1:-}" in
                 shift 2  # remove 'agent' and 'reset'
                 agent_reset_multiple "$@"
                 ;;
+            provider)
+                if [ -z "$3" ]; then
+                    echo "Usage: $0 agent provider <agent_id> [provider] [--model MODEL_NAME]"
+                    echo ""
+                    echo "Examples:"
+                    echo "  $0 agent provider coder                                    # Show current provider/model"
+                    echo "  $0 agent provider coder anthropic                           # Switch to Anthropic"
+                    echo "  $0 agent provider coder openai                              # Switch to OpenAI"
+                    echo "  $0 agent provider coder anthropic --model opus              # Switch to Anthropic Opus"
+                    echo "  $0 agent provider coder openai --model gpt-5.3-codex        # Switch to OpenAI GPT-5.3 Codex"
+                    exit 1
+                fi
+                agent_provider "$3" "$4" "$5" "$6"
+                ;;
             *)
-                echo "Usage: $0 agent {list|add|remove|show|reset}"
+                echo "Usage: $0 agent {list|add|remove|show|reset|provider}"
                 echo ""
                 echo "Agent Commands:"
                 echo "  list                   List all configured agents"
@@ -279,6 +364,7 @@ case "${1:-}" in
                 echo "  remove <id>            Remove an agent"
                 echo "  show <id>              Show agent configuration"
                 echo "  reset <id> [id2 ...]   Reset agent conversation(s)"
+                echo "  provider <id> [...]    Show or set agent's provider and model"
                 echo ""
                 echo "Examples:"
                 echo "  $0 agent list"
@@ -287,6 +373,7 @@ case "${1:-}" in
                 echo "  $0 agent remove coder"
                 echo "  $0 agent reset coder"
                 echo "  $0 agent reset coder researcher"
+                echo "  $0 agent provider coder anthropic --model opus"
                 echo ""
                 echo "In chat, use '@agent_id message' to route to a specific agent."
                 exit 1
@@ -320,8 +407,7 @@ case "${1:-}" in
                 if [ ! -f "$SCRIPT_DIR/dist/visualizer/team-visualizer.js" ] || \
                    [ "$SCRIPT_DIR/src/visualizer/team-visualizer.tsx" -nt "$SCRIPT_DIR/dist/visualizer/team-visualizer.js" ]; then
                     echo -e "${BLUE}Building team visualizer...${NC}"
-                    cd "$SCRIPT_DIR" && npm run build:visualizer 2>/dev/null
-                    if [ $? -ne 0 ]; then
+                    if ! (cd "$SCRIPT_DIR" && npm run build:visualizer 2>/dev/null); then
                         echo -e "${RED}Failed to build visualizer.${NC}"
                         exit 1
                     fi
@@ -386,7 +472,7 @@ case "${1:-}" in
         echo "  channels reset <channel> Reset channel auth ($local_names)"
         echo "  provider [name] [--model model]  Show or switch AI provider"
         echo "  model [name]             Show or switch AI model"
-        echo "  agent {list|add|remove|show|reset}  Manage agents"
+        echo "  agent {list|add|remove|show|reset|provider}  Manage agents"
         echo "  team {list|add|remove|show|visualize}  Manage teams"
         echo "  pairing {pending|approved|list|approve <code>|unpair <channel> <sender_id>}  Manage sender approvals"
         echo "  update                   Update TinyClaw to latest version"

@@ -4,12 +4,9 @@
 # AGENTS_DIR set after loading settings (uses workspace path)
 AGENTS_DIR=""
 
-# Ensure all agent workspaces have .agents/skills symlinked
+# Ensure all agent workspaces have .agents/skills copied from SCRIPT_DIR
 ensure_agent_skills_links() {
     local skills_src="$SCRIPT_DIR/.agents/skills"
-    if [ ! -d "$skills_src" ]; then
-        skills_src="$TINYCLAW_HOME/.agents/skills"
-    fi
     [ -d "$skills_src" ] || return 0
 
     local agents_dir="$WORKSPACE_PATH"
@@ -22,11 +19,30 @@ ensure_agent_skills_links() {
         local agent_dir="$agents_dir/$agent_id"
         [ -d "$agent_dir" ] || continue
 
-        if [ ! -e "$agent_dir/.agents/skills" ]; then
-            mkdir -p "$agent_dir/.agents"
-            ln -s "$skills_src" "$agent_dir/.agents/skills"
-            log "Linked .agents/skills/ for agent @${agent_id}"
+        # Migrate: replace old symlinks with real directories
+        if [ -L "$agent_dir/.agents/skills" ]; then
+            rm "$agent_dir/.agents/skills"
         fi
+        if [ -L "$agent_dir/.claude/skills" ]; then
+            rm "$agent_dir/.claude/skills"
+        fi
+
+        # Sync default skills into .agents/skills
+        # - Overwrites skills that exist in source (keeps them up to date)
+        # - Preserves agent-specific custom skills not in source
+        mkdir -p "$agent_dir/.agents/skills"
+        for skill_dir in "$skills_src"/*/; do
+            [ -d "$skill_dir" ] || continue
+            local skill_name
+            skill_name="$(basename "$skill_dir")"
+            # Always overwrite default skills with latest from source
+            rm -rf "$agent_dir/.agents/skills/$skill_name"
+            cp -r "$skill_dir" "$agent_dir/.agents/skills/$skill_name"
+        done
+
+        # Mirror .agents/skills into .claude/skills for Claude Code
+        mkdir -p "$agent_dir/.claude/skills"
+        cp -r "$agent_dir/.agents/skills/"* "$agent_dir/.claude/skills/" 2>/dev/null || true
     done
 }
 
@@ -133,9 +149,11 @@ agent_add() {
     echo "Provider:"
     echo "  1) Anthropic (Claude)"
     echo "  2) OpenAI (Codex)"
-    read -rp "Choose [1-2, default: 1]: " AGENT_PROVIDER_CHOICE
+    echo "  3) OpenCode"
+    read -rp "Choose [1-3, default: 1]: " AGENT_PROVIDER_CHOICE
     case "$AGENT_PROVIDER_CHOICE" in
         2) AGENT_PROVIDER="openai" ;;
+        3) AGENT_PROVIDER="opencode" ;;
         *) AGENT_PROVIDER="anthropic" ;;
     esac
 
@@ -145,18 +163,43 @@ agent_add() {
         echo "Model:"
         echo "  1) Sonnet (fast)"
         echo "  2) Opus (smartest)"
-        read -rp "Choose [1-2, default: 1]: " AGENT_MODEL_CHOICE
+        echo "  3) Custom (enter model name)"
+        read -rp "Choose [1-3, default: 1]: " AGENT_MODEL_CHOICE
         case "$AGENT_MODEL_CHOICE" in
             2) AGENT_MODEL="opus" ;;
+            3) read -rp "Enter model name: " AGENT_MODEL ;;
             *) AGENT_MODEL="sonnet" ;;
+        esac
+    elif [ "$AGENT_PROVIDER" = "opencode" ]; then
+        echo "Model (provider/model format):"
+        echo "  1) opencode/claude-sonnet-4-5"
+        echo "  2) opencode/claude-opus-4-6"
+        echo "  3) opencode/gemini-3-flash"
+        echo "  4) opencode/gemini-3-pro"
+        echo "  5) anthropic/claude-sonnet-4-5"
+        echo "  6) anthropic/claude-opus-4-6"
+        echo "  7) openai/gpt-5.3-codex"
+        echo "  8) Custom (enter model name)"
+        read -rp "Choose [1-8, default: 1]: " AGENT_MODEL_CHOICE
+        case "$AGENT_MODEL_CHOICE" in
+            2) AGENT_MODEL="opencode/claude-opus-4-6" ;;
+            3) AGENT_MODEL="opencode/gemini-3-flash" ;;
+            4) AGENT_MODEL="opencode/gemini-3-pro" ;;
+            5) AGENT_MODEL="anthropic/claude-sonnet-4-5" ;;
+            6) AGENT_MODEL="anthropic/claude-opus-4-6" ;;
+            7) AGENT_MODEL="openai/gpt-5.3-codex" ;;
+            8) read -rp "Enter model name (e.g. provider/model): " AGENT_MODEL ;;
+            *) AGENT_MODEL="opencode/claude-sonnet-4-5" ;;
         esac
     else
         echo "Model:"
         echo "  1) GPT-5.3 Codex"
         echo "  2) GPT-5.2"
-        read -rp "Choose [1-2, default: 1]: " AGENT_MODEL_CHOICE
+        echo "  3) Custom (enter model name)"
+        read -rp "Choose [1-3, default: 1]: " AGENT_MODEL_CHOICE
         case "$AGENT_MODEL_CHOICE" in
             2) AGENT_MODEL="gpt-5.2" ;;
+            3) read -rp "Enter model name: " AGENT_MODEL ;;
             *) AGENT_MODEL="gpt-5.3-codex" ;;
         esac
     fi
@@ -187,10 +230,12 @@ agent_add() {
         "$SETTINGS_FILE" > "$tmp_file" && mv "$tmp_file" "$SETTINGS_FILE"
 
     # Create agent directory and copy configuration files
-    if [ -f "$SCRIPT_DIR/.tinyclaw/settings.json" ]; then
-        TINYCLAW_HOME="$SCRIPT_DIR/.tinyclaw"
-    else
-        TINYCLAW_HOME="$HOME/.tinyclaw"
+    if [ -z "$TINYCLAW_HOME" ]; then
+        if [ -f "$SCRIPT_DIR/.tinyclaw/settings.json" ]; then
+            TINYCLAW_HOME="$SCRIPT_DIR/.tinyclaw"
+        else
+            TINYCLAW_HOME="$HOME/.tinyclaw"
+        fi
     fi
     mkdir -p "$AGENTS_DIR/$AGENT_ID"
 
@@ -220,25 +265,17 @@ agent_add() {
         echo "  → Copied CLAUDE.md to .claude/ directory"
     fi
 
-    # Resolve skills source directory
+    # Copy default skills from SCRIPT_DIR
     local skills_src="$SCRIPT_DIR/.agents/skills"
-    if [ ! -d "$skills_src" ]; then
-        skills_src="$TINYCLAW_HOME/.agents/skills"
-    fi
-
     if [ -d "$skills_src" ]; then
-        # Symlink skills directory into .claude/skills
-        if [ ! -e "$AGENTS_DIR/$AGENT_ID/.claude/skills" ]; then
-            ln -s "$skills_src" "$AGENTS_DIR/$AGENT_ID/.claude/skills"
-            echo "  → Linked skills to .claude/skills/"
-        fi
+        mkdir -p "$AGENTS_DIR/$AGENT_ID/.agents/skills"
+        cp -r "$skills_src/"* "$AGENTS_DIR/$AGENT_ID/.agents/skills/" 2>/dev/null || true
+        echo "  → Copied skills to .agents/skills/"
 
-        # Symlink .agents/skills directory
-        if [ ! -e "$AGENTS_DIR/$AGENT_ID/.agents/skills" ]; then
-            mkdir -p "$AGENTS_DIR/$AGENT_ID/.agents"
-            ln -s "$skills_src" "$AGENTS_DIR/$AGENT_ID/.agents/skills"
-            echo "  → Linked skills to .agents/skills/"
-        fi
+        # Mirror into .claude/skills for Claude Code
+        mkdir -p "$AGENTS_DIR/$AGENT_ID/.claude/skills"
+        cp -r "$AGENTS_DIR/$AGENT_ID/.agents/skills/"* "$AGENTS_DIR/$AGENT_ID/.claude/skills/" 2>/dev/null || true
+        echo "  → Copied skills to .claude/skills/"
     fi
 
     # Create .tinyclaw directory and copy SOUL.md
@@ -295,6 +332,99 @@ agent_remove() {
     fi
 
     echo -e "${GREEN}✓ Agent '${agent_id}' removed.${NC}"
+}
+
+# Set provider and/or model for a specific agent
+agent_provider() {
+    local agent_id="$1"
+    local provider_arg="$2"
+    local model_arg=""
+
+    # Parse optional --model flag
+    if [ "$3" = "--model" ] && [ -n "$4" ]; then
+        model_arg="$4"
+    fi
+
+    if [ ! -f "$SETTINGS_FILE" ]; then
+        echo -e "${RED}No settings file found.${NC}"
+        exit 1
+    fi
+
+    local agent_json
+    agent_json=$(jq -r "(.agents // {}).\"${agent_id}\" // empty" "$SETTINGS_FILE" 2>/dev/null)
+
+    if [ -z "$agent_json" ]; then
+        echo -e "${RED}Agent '${agent_id}' not found.${NC}"
+        echo ""
+        echo "Available agents:"
+        jq -r '(.agents // {}) | keys[]' "$SETTINGS_FILE" 2>/dev/null | while read -r id; do
+            echo "  @${id}"
+        done
+        exit 1
+    fi
+
+    if [ -z "$provider_arg" ]; then
+        # Show current provider/model for this agent
+        local cur_provider cur_model agent_name
+        cur_provider=$(jq -r "(.agents // {}).\"${agent_id}\".provider // \"anthropic\"" "$SETTINGS_FILE" 2>/dev/null)
+        cur_model=$(jq -r "(.agents // {}).\"${agent_id}\".model // empty" "$SETTINGS_FILE" 2>/dev/null)
+        agent_name=$(jq -r "(.agents // {}).\"${agent_id}\".name // \"${agent_id}\"" "$SETTINGS_FILE" 2>/dev/null)
+        echo -e "${BLUE}Agent: @${agent_id} (${agent_name})${NC}"
+        echo -e "${BLUE}Provider: ${GREEN}${cur_provider}${NC}"
+        if [ -n "$cur_model" ]; then
+            echo -e "${BLUE}Model:    ${GREEN}${cur_model}${NC}"
+        fi
+        return
+    fi
+
+    local tmp_file="$SETTINGS_FILE.tmp"
+
+    case "$provider_arg" in
+        anthropic)
+            if [ -n "$model_arg" ]; then
+                jq --arg id "$agent_id" --arg model "$model_arg" \
+                    '.agents[$id].provider = "anthropic" | .agents[$id].model = $model' \
+                    "$SETTINGS_FILE" > "$tmp_file" && mv "$tmp_file" "$SETTINGS_FILE"
+                echo -e "${GREEN}✓ Agent '${agent_id}' switched to Anthropic with model: ${model_arg}${NC}"
+            else
+                jq --arg id "$agent_id" \
+                    '.agents[$id].provider = "anthropic"' \
+                    "$SETTINGS_FILE" > "$tmp_file" && mv "$tmp_file" "$SETTINGS_FILE"
+                echo -e "${GREEN}✓ Agent '${agent_id}' switched to Anthropic${NC}"
+                echo ""
+                echo "Use 'tinyclaw agent provider ${agent_id} anthropic --model {sonnet|opus}' to also set the model."
+            fi
+            ;;
+        openai)
+            if [ -n "$model_arg" ]; then
+                jq --arg id "$agent_id" --arg model "$model_arg" \
+                    '.agents[$id].provider = "openai" | .agents[$id].model = $model' \
+                    "$SETTINGS_FILE" > "$tmp_file" && mv "$tmp_file" "$SETTINGS_FILE"
+                echo -e "${GREEN}✓ Agent '${agent_id}' switched to OpenAI with model: ${model_arg}${NC}"
+            else
+                jq --arg id "$agent_id" \
+                    '.agents[$id].provider = "openai"' \
+                    "$SETTINGS_FILE" > "$tmp_file" && mv "$tmp_file" "$SETTINGS_FILE"
+                echo -e "${GREEN}✓ Agent '${agent_id}' switched to OpenAI${NC}"
+                echo ""
+                echo "Use 'tinyclaw agent provider ${agent_id} openai --model {gpt-5.3-codex|gpt-5.2}' to also set the model."
+            fi
+            ;;
+        *)
+            echo "Usage: tinyclaw agent provider <agent_id> {anthropic|openai} [--model MODEL_NAME]"
+            echo ""
+            echo "Examples:"
+            echo "  tinyclaw agent provider coder                                    # Show current provider/model"
+            echo "  tinyclaw agent provider coder anthropic                           # Switch to Anthropic"
+            echo "  tinyclaw agent provider coder openai                              # Switch to OpenAI"
+            echo "  tinyclaw agent provider coder anthropic --model opus              # Switch to Anthropic Opus"
+            echo "  tinyclaw agent provider coder openai --model gpt-5.3-codex        # Switch to OpenAI GPT-5.3 Codex"
+            exit 1
+            ;;
+    esac
+
+    echo ""
+    echo "Note: Changes take effect on next message. Restart is not required."
 }
 
 # Reset a specific agent's conversation
